@@ -1,0 +1,121 @@
+# Install necessary packages
+!pip install fiftyone medmnist torchvision
+
+# =============================================================================
+# 1. Import Libraries and Set Up Environment
+# =============================================================================
+import os
+import fiftyone as fo
+import medmnist
+from medmnist import INFO
+import numpy as np
+from PIL import Image
+import torchvision.models as models
+import torch
+import torchvision.transforms as T
+
+# =============================================================================
+# 2. Download and Prepare the MedMNIST Dataset (PathMNIST)
+# =============================================================================
+
+# Create a folder to store images locally
+image_dir = "medmnist_images"
+if not os.path.exists(image_dir):
+    os.makedirs(image_dir)
+
+# Choose the "pathmnist" dataset from MedMNIST
+data_flag = "pathmnist"
+info = INFO[data_flag]
+DataClass = getattr(medmnist, info["python_class"])
+
+# Download the training split (this may take a moment)
+train_dataset = DataClass(split="train", download=True)
+
+# =============================================================================
+# 3. Create a FiftyOne Dataset
+# =============================================================================
+
+# Define a dataset name; if it exists, delete it to avoid conflicts
+dataset_name = "MedMNIST-Path"
+if dataset_name in fo.list_datasets():
+    fo.delete_dataset(dataset_name)
+fo_dataset = fo.Dataset(dataset_name)
+
+# For demonstration purposes, we use a small subset (e.g., 100 samples)
+num_samples = 100
+samples = []
+
+for idx in range(num_samples):
+    # Each sample is a tuple: (image, label)
+    image_data, label = train_dataset[idx]
+    
+    # If image_data is a numpy array, convert to a PIL Image; if already a PIL Image, use it directly.
+    if isinstance(image_data, np.ndarray):
+        try:
+            image = Image.fromarray(image_data)
+        except Exception as e:
+            print("Error converting image at index", idx, ":", e)
+            continue
+    else:
+        image = image_data
+        
+    # Save the image to disk so that FiftyOne can load it via its filepath
+    filepath = os.path.join(image_dir, f"sample_{idx}.png")
+    image.save(filepath)
+    
+    # Create a FiftyOne sample, storing the label in a custom field "ground_truth"
+    sample = fo.Sample(filepath=filepath)
+    sample["ground_truth"] = int(label)
+    
+    # Compute and attach image metadata (dimensions, format, etc.)
+    sample.compute_metadata()
+    
+    samples.append(sample)
+
+# Add all samples to the FiftyOne dataset
+fo_dataset.add_samples(samples)
+
+# Launch the FiftyOne App to inspect the dataset interactively.
+session = fo.launch_app(fo_dataset)
+
+# =============================================================================
+# 4. Compute Image Embeddings Using a Pretrained ResNet-18 Model
+# =============================================================================
+
+# Load a pretrained ResNet-18 model and remove the final classification layer
+model = models.resnet18(pretrained=True)
+model.fc = torch.nn.Identity()  # Remove the final fully connected layer to output embeddings
+model.eval()  # Set model to evaluation mode
+
+# Define image transformations to prepare images for ResNet input
+transform = T.Compose([
+    T.Resize((224, 224)),
+    T.ToTensor(),
+    T.Normalize(mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]),
+])
+
+def compute_embedding(filepath):
+    """
+    Load an image from the given filepath, preprocess it,
+    and compute its embedding using the pretrained model.
+    """
+    image = Image.open(filepath).convert("RGB")
+    image = transform(image).unsqueeze(0)  # Add batch dimension
+    with torch.no_grad():
+        embedding = model(image).squeeze().numpy()
+    return embedding
+
+# Compute and store embeddings for each sample in the dataset
+for sample in fo_dataset:
+    emb = compute_embedding(sample.filepath)
+    sample["embedding"] = emb.tolist()  # Save embedding as a list (for compatibility)
+    sample.save()
+
+# =============================================================================
+# 5. Visualize the Embeddings to Identify Edge Cases
+# =============================================================================
+
+# Use FiftyOne's UMAP scatter plot to visualize embeddings.
+# Clusters in the scatter plot can help identify similar samples, while outliers may indicate edge cases.
+session.plots.scatter(fo_dataset, field="embedding", label_field="ground_truth")
